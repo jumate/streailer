@@ -309,7 +309,8 @@ async function imdbToTmdbWithLanguage(imdbId, type, language) {
         if (results && results.length > 0) {
             const item = results[0];
             const title = item.title || item.name || '';
-            return { id: item.id, title };
+            const year = parseInt((item.release_date || item.first_air_date || '').slice(0, 4), 10) || null;
+            return { id: item.id, title, year };
         }
     } catch (e) {
         console.error('[TrailerProvider] Error converting IMDb to TMDB:', e);
@@ -448,6 +449,35 @@ function cacheSet(key, value, ttl) {
     trailerCache.set(key, { value, expires: Date.now() + ttl });
 }
 
+// ¿Parece una serie de TV cuando buscamos una película? ("Sleepy Hollow TV", "serie", "temporada"...)
+const TV_MARKERS = /\b(tv|serie|series|temporada|season|episodio|episode|cap[ií]tulo|s\d{1,2}e\d{1,2}|t\d{1,2}x\d{1,2})\b/gi;
+
+const MOVIE_MARKERS = /\b(pel[ií]cula|movie|film|largometraje)\b/gi;
+
+function kindPenalty(title, contentName, type) {
+    // Película: penaliza títulos de serie. Serie: penaliza títulos de película.
+    const markerRe = type === 'movie' ? TV_MARKERS : type === 'series' ? MOVIE_MARKERS : null;
+    if (!markerRe) return 0;
+    const nameWords = normalizeForMatch(contentName).split(' ');
+    const markers = (title || '').match(markerRe) || [];
+    // Si el propio título buscado lleva esa palabra, no cuenta
+    return markers.some(m => !nameWords.includes(normalizeForMatch(m))) ? -60 : 0;
+}
+
+// Año (películas): suma si el título menciona el año de estreno (±1), resta si menciona otro distinto.
+function yearScore(title, year, contentName, type) {
+    if (!year) return 0;
+    const nameYears = new Set(((contentName || '').match(/\b(?:19|20)\d{2}\b/g) || []).map(Number));
+    const years = ((title || '').match(/\b(?:19|20)\d{2}\b/g) || []).map(Number).filter(y => !nameYears.has(y));
+    if (years.length === 0) return 0;
+    if (type === 'series') {
+        // Cada temporada tiene su año, pero un año anterior al estreno de la serie es de otra producción
+        return years.some(y => y < year - 1) ? -40 : 0;
+    }
+    if (type !== 'movie') return 0;
+    return years.some(y => Math.abs(y - year) <= 1) ? 15 : -40;
+}
+
 // Normaliza para comparar: minúsculas, sin acentos ni signos, espacios colapsados (vale para cualquier alfabeto)
 function normalizeForMatch(text) {
     return (text || '')
@@ -582,7 +612,7 @@ async function searchYouTubeScraping(query, language = 'en-US') {
 /**
  * Search YouTube for a trailer and return video ID + title if valid
  */
-async function searchYouTubeCandidates(contentName, type, season, language = 'en-US') {
+async function searchYouTubeCandidates(contentName, type, season, language = 'en-US', year = null) {
     const t = getTranslation(language);
 
     // Build localized search query
@@ -590,7 +620,8 @@ async function searchYouTubeCandidates(contentName, type, season, language = 'en
     if (type === 'series' && season !== undefined && season > 0) {
         query = `${primaryTitle(contentName)} ${t.season} ${season} ${t.trailer}`;
     } else {
-        query = `${primaryTitle(contentName)} ${t.trailer}`;
+        // En películas añadimos el año para separarla de series, remakes y secuelas homónimas
+        query = `${primaryTitle(contentName)}${type === 'movie' && year ? ' ' + year : ''} ${t.trailer}`;
     }
 
     console.log(`[TrailerProvider] YouTube search (${language}): ${query}`);
@@ -612,6 +643,8 @@ async function searchYouTubeCandidates(contentName, type, season, language = 'en
         const titleNorm = normalizeForMatch(result.title);
         if (titleVariants(contentName).some(v => titleNorm.startsWith(v))) score += 10;
         score += languageScore(result.title, language);
+        score += yearScore(result.title, year, contentName, type);
+        score += kindPenalty(result.title, contentName, type);
         return score;
     };
     validResults.forEach(r => { r.finalScore = scoreCandidate(r); });
@@ -622,12 +655,18 @@ async function searchYouTubeCandidates(contentName, type, season, language = 'en
     const seenIds = new Set();
     return validResults
         .filter(r => !seenIds.has(r.ytId) && seenIds.add(r.ytId))
-        .map(r => ({ ...r, score: r.finalScore, langScore: languageScore(r.title, language) }));
+        .map(r => ({
+            ...r,
+            score: r.finalScore,
+            langScore: languageScore(r.title, language),
+            // Año o tipo (película/serie) incompatibles: nunca se ofrece como opción extra
+            penalized: yearScore(r.title, year, contentName, type) < 0 || kindPenalty(r.title, contentName, type) < 0
+        }));
 }
 
 // Compatibilidad: solo el mejor candidato (o null)
-async function searchYouTubeTrailer(contentName, type, season, language = 'en-US') {
-    const candidates = await searchYouTubeCandidates(contentName, type, season, language);
+async function searchYouTubeTrailer(contentName, type, season, language = 'en-US', year = null) {
+    const candidates = await searchYouTubeCandidates(contentName, type, season, language, year);
     return candidates[0] || null;
 }
 
@@ -649,6 +688,7 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
         const cacheKey = `${type}:${imdbId || tmdbId}:${season || 0}:${language}`;
         let tmdbIdNum;
         let contentTitle = contentName || '';
+        let contentYear = null;
         let trailerResults = cacheGet(cacheKey);
 
         if (trailerResults) {
@@ -659,14 +699,15 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
             if (tmdbId) {
                 // TMDB ID provided directly
                 tmdbIdNum = tmdbId;
-                // Fetch title from TMDB if not provided
-                if (!contentTitle) {
+                // Fetch title and year from TMDB (the year helps tell the movie apart from homonyms)
+                if (!contentTitle || contentYear === null) {
                     const mediaType = type === 'series' ? 'tv' : 'movie';
                     try {
                         const url = `${TMDB_BASE}/${mediaType}/${tmdbId}?api_key=${TMDB_KEY}&language=${language}`;
                         const response = await fetchWithTimeout(url);
                         const data = await response.json();
-                        contentTitle = data.title || data.name || '';
+                        contentTitle = contentTitle || data.title || data.name || '';
+                        contentYear = parseInt((data.release_date || data.first_air_date || '').slice(0, 4), 10) || null;
                     } catch (e) {
                         console.log(`[TrailerProvider] Could not fetch title for TMDB ${tmdbId}`);
                     }
@@ -682,6 +723,7 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
                 if (!contentTitle) {
                     contentTitle = tmdbResult.title;
                 }
+                contentYear = tmdbResult.year || null;
             } else {
                 console.log('[TrailerProvider] No valid ID provided');
                 return [];
@@ -718,13 +760,14 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
             let ytCandidates = [];
             if (BEST_MODE || !tmdbCandidate) {
                 console.log(`[TrailerProvider] Step 2: Trying YouTube (${language}) for "${contentTitle}"`);
-                const ytResults = await searchYouTubeCandidates(contentTitle, type, season, language);
+                const ytResults = await searchYouTubeCandidates(contentTitle, type, season, language, contentYear);
                 ytCandidates = ytResults.slice(0, 5).map(r => ({
                     ytId: r.ytId,
                     title: r.title,
                     source: 'youtube',
                     score: r.score,
-                    langOk: !language.startsWith('es') || r.langScore > 0
+                    langOk: !language.startsWith('es') || r.langScore > 0,
+                    penalized: r.penalized
                 }));
             }
 
@@ -739,7 +782,7 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
             if (finalists.length > 0) {
                 // El mejor siempre; las extras solo si están en el idioma pedido y puntúan lo suficiente
                 const extras = finalists.slice(1)
-                    .filter(c => (c.source === 'tmdb-lang' || c.langOk) && c.score >= EXTRA_MIN_SCORE)
+                    .filter(c => (c.source === 'tmdb-lang' || c.langOk) && !c.penalized && c.score >= EXTRA_MIN_SCORE)
                     .slice(0, TRAILER_MAX - 1);
                 trailerResults = [finalists[0], ...extras];
             }
