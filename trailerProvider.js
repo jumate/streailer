@@ -343,11 +343,30 @@ async function fetchTMDBVideos(tmdbId, type, language, season) {
 }
 
 // ===== Selección del mejor tráiler (idioma + calidad) =====
+// Lee un número de una variable de entorno; si falta o no es válido, usa el valor por defecto
+function envNumber(name, fallback, { min = -Infinity, max = Infinity } = {}) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) {
+        console.warn(`[TrailerProvider] ${name}="${raw}" no es un número válido; uso ${fallback}`);
+        return fallback;
+    }
+    return Math.min(max, Math.max(min, n));
+}
+
 // TRAILER_BEST=0 restaura el comportamiento antiguo (TMDB primero, YouTube solo si TMDB no tiene nada)
 const BEST_MODE = process.env.TRAILER_BEST !== '0';
 // Puntos que recibe un vídeo de TMDB por venir ya filtrado en el idioma pedido.
 // Súbelo si prefieres que TMDB gane más a menudo; bájalo para favorecer YouTube.
-const TMDB_LANG_BASE = 15;
+// Variable de entorno: TMDB_LANG_BASE (por defecto 15)
+const TMDB_LANG_BASE = envNumber('TMDB_LANG_BASE', 15);
+// Cuántas opciones de tráiler devolver (1 por defecto, máximo 5). Las extras deben estar en el
+// idioma pedido (en español: título con español/castellano/latino/doblado, o venir de TMDB) y
+// superar EXTRA_MIN_SCORE; el mejor siempre va primero.
+const TRAILER_MAX = Math.min(5, Math.max(1, parseInt(process.env.TRAILER_MAX, 10) || 1));
+// Variable de entorno: EXTRA_MIN_SCORE (por defecto 20)
+const EXTRA_MIN_SCORE = envNumber('EXTRA_MIN_SCORE', 20);
 
 const FOREIGN_MARKERS = /\b(italiano|deutsch|german|fran[cç]ais|francais|vostfr|portugu[eê]s|dublado|legendado)\b/i;
 
@@ -401,10 +420,16 @@ function selectBestTrailer(videos) {
 }
 
 // Caché en memoria: evita repetir scraping de YouTube por cada petición de Stremio
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;      // resultados buenos
-const CACHE_SHORT_TTL_MS = 30 * 60 * 1000;         // fallback inglés (por si YouTube falló un momento)
+// Variables de entorno: CACHE_TTL_HOURS (168 = 7 días; 0 desactiva la caché) y
+// CACHE_FALLBACK_TTL_MINUTES (30; para el fallback inglés, por si YouTube falló un momento)
+const CACHE_TTL_MS = envNumber('CACHE_TTL_HOURS', 168, { min: 0 }) * 60 * 60 * 1000;
+const CACHE_SHORT_TTL_MS = envNumber('CACHE_FALLBACK_TTL_MINUTES', 30, { min: 0 }) * 60 * 1000;
 const CACHE_MAX = 2000;
 const trailerCache = new Map();
+
+console.log(`[TrailerProvider] Config: BEST_MODE=${BEST_MODE} TRAILER_MAX=${TRAILER_MAX} TMDB_LANG_BASE=${TMDB_LANG_BASE} ` +
+    `EXTRA_MIN_SCORE=${EXTRA_MIN_SCORE} CACHE_TTL_HOURS=${CACHE_TTL_MS / 3600000} ` +
+    `CACHE_FALLBACK_TTL_MINUTES=${CACHE_SHORT_TTL_MS / 60000}`);
 
 function cacheGet(key) {
     const hit = trailerCache.get(key);
@@ -557,7 +582,7 @@ async function searchYouTubeScraping(query, language = 'en-US') {
 /**
  * Search YouTube for a trailer and return video ID + title if valid
  */
-async function searchYouTubeTrailer(contentName, type, season, language = 'en-US') {
+async function searchYouTubeCandidates(contentName, type, season, language = 'en-US') {
     const t = getTranslation(language);
 
     // Build localized search query
@@ -577,7 +602,7 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
     if (validResults.length === 0) {
         console.log(`[TrailerProvider] No YouTube result matched "${contentName}"; first candidates:`);
         results.slice(0, 3).forEach(r => console.log(`[TrailerProvider]   - "${r.title}" (${r.ytId})`));
-        return null;
+        return [];
     }
 
     // result.score ya incluye canal oficial, calidad (HD/4K) y penalizaciones; aquí solo
@@ -594,7 +619,16 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
     validResults.slice(0, 3).forEach(r =>
         console.log(`[TrailerProvider]   YouTube candidate ${r.finalScore}: "${r.title}" (${r.ytId})`));
     console.log(`[TrailerProvider] YouTube result accepted: "${validResults[0].title}"`);
-    return { ...validResults[0], score: validResults[0].finalScore };
+    const seenIds = new Set();
+    return validResults
+        .filter(r => !seenIds.has(r.ytId) && seenIds.add(r.ytId))
+        .map(r => ({ ...r, score: r.finalScore, langScore: languageScore(r.title, language) }));
+}
+
+// Compatibilidad: solo el mejor candidato (o null)
+async function searchYouTubeTrailer(contentName, type, season, language = 'en-US') {
+    const candidates = await searchYouTubeCandidates(contentName, type, season, language);
+    return candidates[0] || null;
 }
 
 /**
@@ -615,11 +649,12 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
         const cacheKey = `${type}:${imdbId || tmdbId}:${season || 0}:${language}`;
         let tmdbIdNum;
         let contentTitle = contentName || '';
-        let trailerResult = cacheGet(cacheKey);
+        let trailerResults = cacheGet(cacheKey);
 
-        if (trailerResult) {
-            console.log(`[TrailerProvider] Cache hit ${cacheKey}: ${trailerResult.ytId} (${trailerResult.source})`);
+        if (trailerResults) {
+            console.log(`[TrailerProvider] Cache hit ${cacheKey}: ${trailerResults.map(r => r.ytId).join(', ')} (${trailerResults[0].source})`);
         } else {
+            trailerResults = [];
             // Get TMDB ID and title
             if (tmdbId) {
                 // TMDB ID provided directly
@@ -680,30 +715,38 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
             }
 
             // === STEP 2: YouTube scraping (siempre en modo "mejor"; solo como fallback en modo antiguo) ===
-            let ytCandidate = null;
+            let ytCandidates = [];
             if (BEST_MODE || !tmdbCandidate) {
                 console.log(`[TrailerProvider] Step 2: Trying YouTube (${language}) for "${contentTitle}"`);
-                const ytResult = await searchYouTubeTrailer(contentTitle, type, season, language);
-                if (ytResult) {
-                    ytCandidate = {
-                        ytId: ytResult.ytId,
-                        title: ytResult.title,
-                        source: 'youtube',
-                        score: ytResult.score
-                    };
-                }
+                const ytResults = await searchYouTubeCandidates(contentTitle, type, season, language);
+                ytCandidates = ytResults.slice(0, 5).map(r => ({
+                    ytId: r.ytId,
+                    title: r.title,
+                    source: 'youtube',
+                    score: r.score,
+                    langOk: !language.startsWith('es') || r.langScore > 0
+                }));
             }
 
-            // Elegir el mejor; en empate gana TMDB
-            const finalists = [tmdbCandidate, ytCandidate].filter(Boolean)
+            // Elegir el mejor; en empate gana TMDB. Sin duplicados.
+            const seen = new Set();
+            const finalists = [tmdbCandidate, ...ytCandidates].filter(Boolean)
+                .filter(c => !seen.has(c.ytId) && seen.add(c.ytId))
                 .sort((x, y) => y.score - x.score || (x.source === 'tmdb-lang' ? -1 : 1));
             finalists.forEach(c =>
                 console.log(`[TrailerProvider]   finalist ${c.source}: score ${c.score} (${c.ytId})`));
-            trailerResult = finalists[0] || null;
+
+            if (finalists.length > 0) {
+                // El mejor siempre; las extras solo si están en el idioma pedido y puntúan lo suficiente
+                const extras = finalists.slice(1)
+                    .filter(c => (c.source === 'tmdb-lang' || c.langOk) && c.score >= EXTRA_MIN_SCORE)
+                    .slice(0, TRAILER_MAX - 1);
+                trailerResults = [finalists[0], ...extras];
+            }
         }
 
         // === STEP 3: TMDB English Fallback ===
-        if (!trailerResult && !isEnglish) {
+        if (trailerResults.length === 0 && !isEnglish) {
             console.log(`[TrailerProvider] Step 3: Trying TMDB en-US for "${contentTitle}"`);
 
             let enVideos = [];
@@ -720,64 +763,67 @@ async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, lang
             const tmdbEnTrailer = selectBestTrailer(enVideos);
             if (tmdbEnTrailer) {
                 console.log(`[TrailerProvider] ✓ Found TMDB en-US trailer: ${tmdbEnTrailer.name}`);
-                trailerResult = {
+                trailerResults = [{
                     ytId: tmdbEnTrailer.key,
                     title: type === 'series' && season ? `${contentTitle} ${t.season} ${season}` : contentTitle,
                     source: 'tmdb-en'
-                };
+                }];
             }
         }
 
-        if (trailerResult && !cacheGet(cacheKey)) {
-            cacheSet(cacheKey, trailerResult, trailerResult.source === 'tmdb-en' ? CACHE_SHORT_TTL_MS : CACHE_TTL_MS);
+        if (trailerResults.length > 0 && !cacheGet(cacheKey)) {
+            cacheSet(cacheKey, trailerResults, trailerResults[0].source === 'tmdb-en' ? CACHE_SHORT_TTL_MS : CACHE_TTL_MS);
         }
 
         // No trailer found
-        if (!trailerResult) {
+        if (trailerResults.length === 0) {
             console.log(`[TrailerProvider] ✗ No trailer found for ${imdbId}`);
             return [];
         }
 
-        // Build stream name based on source
-        let streamName;
-        switch (trailerResult.source) {
-            case 'tmdb-lang':
-                streamName = '🎬 Trailer';
-                break;
-            case 'youtube':
-                streamName = '🎬▶️ Trailer';
-                break;
-            case 'tmdb-en':
-                streamName = '🎬🇬🇧 Trailer';
-                break;
-            default:
-                streamName = '🎬 Trailer';
-        }
-
-        // Add external link indicator if enabled
-        if (useExternalLink) {
-            streamName = '🔗 ' + streamName;
-        }
-
-        console.log(`[TrailerProvider] Final: ${streamName} | ${trailerResult.title} (${trailerResult.source})${useExternalLink ? ' [External]' : ''}`);
-
-        const trailerStream = {
-            name: streamName,
-            title: trailerResult.title,
-            behaviorHints: {
-                notWebReady: true,
-                bingeGroup: 'trailer'
+        return trailerResults.map((trailerResult, index) => {
+            // Build stream name based on source
+            let streamName;
+            switch (trailerResult.source) {
+                case 'tmdb-lang':
+                    streamName = '🎬 Trailer';
+                    break;
+                case 'youtube':
+                    streamName = '🎬▶️ Trailer';
+                    break;
+                case 'tmdb-en':
+                    streamName = '🎬🇬🇧 Trailer';
+                    break;
+                default:
+                    streamName = '🎬 Trailer';
             }
-        };
+            if (index > 0) streamName += ` ${index + 1}`;
 
-        // Use externalUrl for external app, or ytId for internal player
-        if (useExternalLink) {
-            trailerStream.externalUrl = `https://www.youtube.com/watch?v=${trailerResult.ytId}`;
-        } else {
-            trailerStream.ytId = trailerResult.ytId;
-        }
+            // Add external link indicator if enabled
+            if (useExternalLink) {
+                streamName = '🔗 ' + streamName;
+            }
 
-        return [trailerStream];
+            console.log(`[TrailerProvider] Final #${index + 1}: ${streamName} | ${trailerResult.title} (${trailerResult.source})${useExternalLink ? ' [External]' : ''}`);
+
+            const trailerStream = {
+                name: streamName,
+                title: trailerResult.title,
+                behaviorHints: {
+                    notWebReady: true,
+                    bingeGroup: 'trailer'
+                }
+            };
+
+            // Use externalUrl for external app, or ytId for internal player
+            if (useExternalLink) {
+                trailerStream.externalUrl = `https://www.youtube.com/watch?v=${trailerResult.ytId}`;
+            } else {
+                trailerStream.ytId = trailerResult.ytId;
+            }
+
+            return trailerStream;
+        });
 
     } catch (e) {
         console.error('[TrailerProvider] Error getting trailer streams:', e);
