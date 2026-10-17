@@ -393,16 +393,19 @@ function validateYouTubeTitle(videoTitle, contentName, season, language = 'en-US
 /**
  * Search YouTube using HTML scraping
  */
-async function searchYouTubeScraping(query) {
+async function searchYouTubeScraping(query, language = 'en-US') {
     try {
-        const encodedQuery = encodeURIComponent(query);
-        const url = `https://www.youtube.com/results?search_query=${encodedQuery}`;
+        const [lang, country] = language.split('-');
+        const encodedQuery = encodeURIComponent(query);        
+        const url = `https://www.youtube.com/results?search_query=${encodedQuery}&gl=${country || 'US'}&hl=${lang || 'en'}`;
 
         console.log(`[TrailerProvider] YouTube scraping search: ${query}`);
 
         const response = await fetchWithTimeout(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                 'Accept-Language': `${lang}-${country},${lang};q=0.9,en;q=0.8`,
+                 'Cookie': `PREF=hl=${lang}&gl=${country}; CONSENT=YES+`
             }
         });
 
@@ -470,7 +473,7 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
 
     console.log(`[TrailerProvider] YouTube search (${language}): ${query}`);
 
-    const result = await searchYouTubeScraping(query);
+    const result = await searchYouTubeScraping(query, language);
 
     if (!result) {
         return null;
@@ -491,7 +494,7 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
  * Flow: TMDB (user language) → YouTube scraping (localized) → TMDB en-US
  * Note: Recaps are now handled by recapProvider.js
  */
-async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, language = 'it-IT', useExternalLink = false) {
+async function getTrailerStreams(type, imdbId, contentName, season, tmdbId, language = process.env.DEFAULT_LANGUAGE || 'es-ES', useExternalLink = false) {
     if (!TMDB_KEY) {
         console.warn('[TrailerProvider] TMDB_KEY not set, skipping trailer fetch');
         return [];
