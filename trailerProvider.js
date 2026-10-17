@@ -423,28 +423,49 @@ function cacheSet(key, value, ttl) {
     trailerCache.set(key, { value, expires: Date.now() + ttl });
 }
 
+// Normaliza para comparar: minúsculas, sin acentos ni signos, espacios colapsados (vale para cualquier alfabeto)
+function normalizeForMatch(text) {
+    return (text || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+// Quita subtítulos entre paréntesis/corchetes: "Sleepy Hollow (El Jinete sin Cabeza)" -> "Sleepy Hollow"
+function primaryTitle(name) {
+    const cleaned = (name || '').replace(/\s*[\(\[][^\)\]]*[\)\]]/g, '').replace(/\s+/g, ' ').trim();
+    return cleaned || (name || '');
+}
+
+// Variantes aceptables del título: el completo y el principal sin paréntesis
+function titleVariants(name) {
+    const variants = new Set();
+    const full = normalizeForMatch(name);
+    if (full) variants.add(full);
+    const main = normalizeForMatch(primaryTitle(name));
+    if (main.length >= 3) variants.add(main);
+    return [...variants];
+}
+
 /**
  * Validate YouTube video title against expected content
  * Uses language-specific validation
  */
 function validateYouTubeTitle(videoTitle, contentName, season, language = 'en-US') {
-    const titleLower = videoTitle.toLowerCase();
-    const contentLower = contentName.toLowerCase();
+    const titleNorm = normalizeForMatch(videoTitle);
 
-    // Must contain the content name (movie/series title)
-    if (!titleLower.includes(contentLower)) {
+    // Must contain the content name (movie/series title), full or without parenthetical subtitle
+    if (!titleMatches(titleNorm, contentName)) {
         return false;
     }
-
-    // For series with season, check if valid
-    if (season !== undefined && season > 0) {
-        const t = getTranslation(language);
-        const seasonWords = t.numberWords[season] || [season.toString()];
-        // Accept if content name matches - season number is optional
-        return true;
-    }
-
     return true;
+}
+
+function titleMatches(titleNorm, contentName) {
+    return titleVariants(contentName).some(v => titleNorm.includes(v));
 }
 
 /**
@@ -542,9 +563,9 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
     // Build localized search query
     let query;
     if (type === 'series' && season !== undefined && season > 0) {
-        query = `${contentName} ${t.season} ${season} ${t.trailer}`;
+        query = `${primaryTitle(contentName)} ${t.season} ${season} ${t.trailer}`;
     } else {
-        query = `${contentName} ${t.trailer}`;
+        query = `${primaryTitle(contentName)} ${t.trailer}`;
     }
 
     console.log(`[TrailerProvider] YouTube search (${language}): ${query}`);
@@ -554,7 +575,8 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
         validateYouTubeTitle(result.title, contentName, season, language)
     );
     if (validResults.length === 0) {
-        console.log(`[TrailerProvider] No YouTube result matched "${contentName}"`);
+        console.log(`[TrailerProvider] No YouTube result matched "${contentName}"; first candidates:`);
+        results.slice(0, 3).forEach(r => console.log(`[TrailerProvider]   - "${r.title}" (${r.ytId})`));
         return null;
     }
 
@@ -562,7 +584,8 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
     // se añade el idioma y que el título empiece por el nombre buscado.
     const scoreCandidate = result => {
         let score = result.score || 0;
-        if (result.title.toLowerCase().startsWith(contentName.toLowerCase())) score += 10;
+        const titleNorm = normalizeForMatch(result.title);
+        if (titleVariants(contentName).some(v => titleNorm.startsWith(v))) score += 10;
         score += languageScore(result.title, language);
         return score;
     };
