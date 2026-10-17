@@ -351,19 +351,17 @@ function selectBestTrailer(videos) {
     const youtubeVideos = videos.filter(v => v.site === 'YouTube');
     if (youtubeVideos.length === 0) return null;
 
-    const typePriority = ['Trailer', 'Teaser', 'Clip'];
-
-    for (const type of typePriority) {
-        const official = youtubeVideos.find(v => v.type === type && v.official);
-        if (official) return official;
-    }
-
-    for (const type of typePriority) {
-        const video = youtubeVideos.find(v => v.type === type);
-        if (video) return video;
-    }
-
-    return youtubeVideos[0];
+    // TMDB no publica la resolución del vídeo. Priorizamos oficialidad y tipo.
+    const typeScore = { Trailer: 30, Teaser: 20, Clip: 10 };
+    return youtubeVideos
+        .map((video, index) => ({
+            video,
+            index,
+            score: (typeScore[video.type] || 0) +
+                (video.official ? 100 : 0) +
+                (/\b(4k|2160p|1080p|hd)\b/i.test(video.name || '') ? 5 : 0)
+        }))
+        .sort((a, b) => b.score - a.score || a.index - b.index)[0].video;
 }
 
 /**
@@ -397,7 +395,7 @@ async function searchYouTubeScraping(query, language = 'en-US') {
     try {
         const [lang, country] = language.split('-');
         const encodedQuery = encodeURIComponent(query);        
-        const url = `https://www.youtube.com/results?search_query=${encodedQuery}&gl=${country || 'US'}&hl=${lang || 'en'}`;
+        const url = `https://youtube.com{encodedQuery}&gl=${country || 'US'}&hl=${lang || 'en'}`;
 
         console.log(`[TrailerProvider] YouTube scraping search: ${query}`);
 
@@ -411,51 +409,70 @@ async function searchYouTubeScraping(query, language = 'en-US') {
 
         if (response.status !== 200) {
             console.log('[TrailerProvider] YouTube scraping failed:', response.status);
-            return null;
+            return [];
         }
 
         const html = await response.text();
 
-        // Extract video ID
-        const videoIdMatch = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-        if (!videoIdMatch) {
+        // YouTube devuelve varios videoRenderer; analizamos candidatos, no solo el primero.
+        const rendererMarker = /"videoRenderer":\s*\{/g;
+        const starts = [];
+        let marker;
+        while ((marker = rendererMarker.exec(html)) !== null) {
+            starts.push(marker.index + marker[0].length - 1);
+        }
+        if (starts.length === 0) {
             console.log('[TrailerProvider] No video ID found in YouTube HTML');
-            return null;
+            return [];
         }
 
-        const ytId = videoIdMatch[1];
-
-        // Try to extract title
-        let videoTitle = '';
-        const titleMatch = html.match(/"title":\s*{\s*"runs":\s*\[\s*{\s*"text":\s*"([^"]+)"/);
-        if (titleMatch) {
-            videoTitle = titleMatch[1];
-        } else {
-            const simpleTitleMatch = html.match(/"title":\s*"([^"]+)"/);
-            if (simpleTitleMatch) {
-                videoTitle = simpleTitleMatch[1];
-            }
-        }
-
-        if (!videoTitle) {
-            console.log('[TrailerProvider] Could not extract title from YouTube HTML');
-            return null;
-        }
-
-        // Decode HTML entities
-        videoTitle = videoTitle
+        const results = [];
+        const decodeText = value => value
             .replace(/\\u0026/g, '&')
+            .replace(/\\u003c/g, '<')
+            .replace(/\\u003e/g, '>')
             .replace(/\\"/g, '"')
             .replace(/\\\\/g, '\\');
 
-        console.log(`[TrailerProvider] YouTube scraping found: "${videoTitle}" (${ytId})`);
-        return { ytId, title: videoTitle };
+        for (let i = 0; i < starts.length; i++) {
+            const block = html.slice(starts[i], starts[i + 1] || html.length);
+            const idMatch = block.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+            if (!idMatch) continue;
+
+            const titleMatch = block.match(/"title":\s*\{\s*"runs":\s*\[\s*\{\s*"text":\s*"((?:\\.\vert{}[^"\\])*)"/) ||
+                block.match(/"title":\s*\{\s*"simpleText":\s*"((?:\\.|[^"\\])*)"/);
+            if (!titleMatch) continue;
+
+            const title = decodeText(titleMatch[1]);
+            const channelMatch = block.match(/"ownerText":\s*\{\s*"runs":\s*\[\s*\{\s*"text":\s*"((?:\\.\vert{}[^"\\])*)"/);
+            const channel = channelMatch ? decodeText(channelMatch[1]) : '';
+            const combined = `${title} ${channel}`;
+            let score = 0;
+            if (/\b(official|warner bros|sony pictures|paramount pictures|universal pictures|20th century studios|disney|netflix)\b/i.test(combined)) score += 20;
+            if (/\b(4k|2160p)\b/i.test(title)) score += 12;
+            else if (/\b(1080p|full hd|hd)\b/i.test(title)) score += 8;
+            if (/\b(trailer|official trailer|teaser)\b/i.test(title)) score += 5;
+            if (/\b(clip|fan made|reaction|review|recap|gameplay)\b/i.test(title)) score -= 15;
+
+            results.push({ ytId: idMatch[1], title, channel, score });
+            if (results.length >= 20) break;
+        }
+
+        if (results.length === 0) {
+            console.log('[TrailerProvider] Could not extract YouTube results');
+            return [];
+        }
+
+        results.sort((a, b) => b.score - a.score);
+        console.log(`[TrailerProvider] YouTube scraping found ${results.length} candidate(s); best: "${results[0].title}" (${results[0].ytId})`);
+        return results;
 
     } catch (e) {
         console.error('[TrailerProvider] YouTube scraping error:', e);
-        return null;
+        return [];
     }
 }
+
 
 /**
  * Search YouTube for a trailer and return video ID + title if valid
@@ -473,20 +490,29 @@ async function searchYouTubeTrailer(contentName, type, season, language = 'en-US
 
     console.log(`[TrailerProvider] YouTube search (${language}): ${query}`);
 
-    const result = await searchYouTubeScraping(query, language);
-
-    if (!result) {
+    const results = await searchYouTubeScraping(query, language);
+    const validResults = results.filter(result =>
+        validateYouTubeTitle(result.title, contentName, season, language)
+    );
+    if (validResults.length === 0) {
+        console.log(`[TrailerProvider] No YouTube result matched "${contentName}"`);
         return null;
     }
 
-    // Validate the title
-    if (!validateYouTubeTitle(result.title, contentName, season, language)) {
-        console.log(`[TrailerProvider] YouTube result rejected: title doesn't match "${contentName}"`);
-        return null;
-    }
-
-    console.log(`[TrailerProvider] YouTube result accepted: "${result.title}"`);
-    return result;
+    const scoreCandidate = result => {
+        let score = result.score || 0;
+        const title = result.title.toLowerCase();
+        const expected = contentName.toLowerCase();
+        if (title.startsWith(expected)) score += 10;
+        if (/\b(official trailer|official|trailer)\b/i.test(title)) score += 5;
+        if (/\b(4k|2160p)\b/i.test(title)) score += 12;
+        else if (/\b(1080p|full hd|hd)\b/i.test(title)) score += 8;
+        if (/\b(fan made|reaction|review|recap|clip)\b/i.test(title)) score -= 15;
+        return score;
+    };
+    validResults.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
+    console.log(`[TrailerProvider] YouTube result accepted: "${validResults[0].title}"`);
+    return validResults[0];
 }
 
 /**
