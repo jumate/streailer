@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 require('dotenv').config();
-
+const DEFAULT_LANGUAGE = process.env.DEFAULT_LANGUAGE || 'es-ES';
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const express = require('express');
 const path = require('path');
@@ -57,7 +57,7 @@ const manifest = {
             type: 'select',
             title: 'Lingua Trailer / Trailer Language',
             options: SUPPORTED_LANGUAGES.map(l => l.code),
-            default: 'it-IT',
+            default: DEFAULT_LANGUAGE,
             required: true
         },
         {
@@ -102,9 +102,11 @@ builder.defineStreamHandler(async ({ type, id, config }) => {
             return { streams: [] };
         }
 
-        // Get config options
-        const language = config?.language || 'it-IT';
-        const useExternalLink = config?.externalLink === 'true' || config?.externalLink === true;
+        // Get config options        
+        const language = config?.language || config?.lang || DEFAULT_LANGUAGE;
+        const extRaw = config?.externalLink ?? config?.external;
+        const useExternalLink = extRaw === 'true' || extRaw === true;
+        
         const showRecap = config?.showRecap === 'true' || config?.showRecap === true;
         const onlyRecaps = config?.onlyRecaps === 'true' || config?.onlyRecaps === true;
 
