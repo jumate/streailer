@@ -378,18 +378,26 @@ function qualityScore(text) {
     return 0;
 }
 
+// "Subtitulado" no es "en español": el audio es el original aunque los subtítulos estén en español.
+// Si aparece también "doblado", se considera doblado.
+const SUBTITLE_MARKERS = /\b(subtitulad[oa]s?|subt[ií]tulos?|subtitled|subtitles?|subs?|vose|vos|vosi)\b/i;
+const DUBBED_MARKERS = /\bdoblad[oa]s?\b/i;
+
 // Bonus/penalización según el idioma del título del vídeo (solo español; el resto devuelve 0)
 function languageScore(title, language) {
     const t = title || '';
+    if (language !== 'es-ES' && language !== 'es-MX') return 0;
+
     let s = 0;
-    if (language === 'es-ES') {
-        if (/latino|latinoam[eé]rica/i.test(t)) s += 12;
-        else if (/\b(espa[ñn]ol|castellano|doblad[oa])\b/i.test(t)) s += 30;
-    } else if (language === 'es-MX') {
-        if (/latino|latinoam[eé]rica|mexic/i.test(t)) s += 30;
-        else if (/\b(espa[ñn]ol|castellano|doblad[oa])\b/i.test(t)) s += 12;
-    } else {
-        return 0;
+    const subtitledOnly = SUBTITLE_MARKERS.test(t) && !DUBBED_MARKERS.test(t);
+    if (!subtitledOnly) {
+        if (language === 'es-ES') {
+            if (/latino|latinoam[eé]rica/i.test(t)) s += 12;
+            else if (/\b(espa[ñn]ol|castellano|doblad[oa])\b/i.test(t)) s += 30;
+        } else {
+            if (/latino|latinoam[eé]rica|mexic/i.test(t)) s += 30;
+            else if (/\b(espa[ñn]ol|castellano|doblad[oa])\b/i.test(t)) s += 12;
+        }
     }
     if (FOREIGN_MARKERS.test(t)) s -= 40;
     return s;
